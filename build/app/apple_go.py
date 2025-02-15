@@ -19,6 +19,15 @@ class AppleTarget(object):
         self.sdk = sdk
         self.min_version = min_version
 
+class AppleStaticLib(object):
+    def __init__(
+        self, sdk: str, apple_archs: list[str]
+    ):
+        self.sdk = sdk
+        self.apple_archs = apple_archs
+
+    def lib_name(self) -> str:
+        return f"{self.sdk}-{'-'.join(self.apple_archs)}"
 
 class AppleGoBuilder(Builder):
     def __init__(self, build_dir: str):
@@ -37,6 +46,9 @@ class AppleGoBuilder(Builder):
                 "iphoneos",
                 "15.0",
             ),
+        ]
+
+        self.ios_simulator_targets = [
             AppleTarget(
                 "ios",
                 "amd64",
@@ -79,6 +91,9 @@ class AppleGoBuilder(Builder):
                 "appletvos",
                 "17.0",
             ),
+        ]
+
+        self.tv_simulator_targets = [
             AppleTarget(
                 "ios",
                 "amd64",
@@ -96,6 +111,7 @@ class AppleGoBuilder(Builder):
         ]
 
     def before_build(self):
+        self.reset_files()
         super().before_build()
         self.clean_lib_dirs(["LibXray.xcframework"])
         self.prepare_static_lib()
@@ -103,30 +119,31 @@ class AppleGoBuilder(Builder):
     def build(self):
         self.before_build()
         # build ios
-        self.build_targets(self.ios_targets)
-        self.merge_static_lib(
-            self.ios_targets[1].sdk,
-            [self.ios_targets[1].apple_arch, self.ios_targets[2].apple_arch],
-        )
+        ios_lib = self.build_targets(self.ios_targets)[0]
+        self.create_framework(ios_lib)
+
+        ios_simulator_libs = self.build_targets(self.ios_simulator_targets)
+        ios_simulator_lib = self.merge_static_lib(ios_simulator_libs)
+        self.create_framework(ios_simulator_lib)
+
         # build macos
-        self.build_targets(self.macos_targets)
-        self.merge_static_lib(
-            self.macos_targets[0].sdk,
-            [self.macos_targets[0].apple_arch, self.macos_targets[1].apple_arch],
-        )
+        macos_libs = self.build_targets(self.macos_targets)
+        macos_lib = self.merge_static_lib(macos_libs)
+        self.create_framework(macos_lib)
         # build tvos
-        self.build_targets(self.tvos_targets)
-        self.merge_static_lib(
-            self.tvos_targets[1].sdk,
-            [self.tvos_targets[1].apple_arch, self.tvos_targets[2].apple_arch],
-        )
+        tvos_lib = self.build_targets(self.tvos_targets)[0]
+        self.create_framework(tvos_lib)
+
+        tv_simulator_libs = self.build_targets(self.tv_simulator_targets)
+        tv_simulator_lib = self.merge_static_lib(tv_simulator_libs)
+        self.create_framework(tv_simulator_lib)
 
         self.after_build()
 
-        self.create_include_dir()
-        self.create_framework()
+        self.create_xcframework([ios_lib, ios_simulator_lib, macos_lib, tvos_lib, tv_simulator_lib])
 
-    def build_targets(self, targets: list[AppleTarget]):
+    def build_targets(self, targets: list[AppleTarget]) -> list[AppleStaticLib]:
+        libs = []
         for target in targets:
             self.run_build_cmd(
                 target.platform,
@@ -135,6 +152,9 @@ class AppleGoBuilder(Builder):
                 target.sdk,
                 target.min_version,
             )
+            libs.append(AppleStaticLib(target.sdk, [target.apple_arch]))
+
+        return libs
 
     def run_build_cmd(
         self, platform: str, go_arch: str, apple_arch: str, sdk: str, min_version: str
@@ -184,11 +204,14 @@ class AppleGoBuilder(Builder):
             raise Exception(f"get_sdk_dir_path for {sdk} failed")
         return ret.stdout.decode().replace("\n", "")
 
-    def merge_static_lib(self, sdk: str, arches: list[str]):
+    def merge_static_lib(self, libs: list[AppleStaticLib]) -> AppleStaticLib:
         cmd = [
             "lipo",
             "-create",
         ]
+        sdk = libs[0].sdk
+        arches = list(set([item for row in map(lambda x: x.apple_archs, libs) for item in row]))
+        arches.sort()
         for arch in arches:
             lib_dir = os.path.join(self.framework_dir, f"{sdk}-{arch}")
             lib_file = os.path.join(lib_dir, self.lib_file)
@@ -202,32 +225,44 @@ class AppleGoBuilder(Builder):
         ret = subprocess.run(cmd)
         if ret.returncode != 0:
             raise Exception(f"merge_static_lib for {sdk} failed")
+        return AppleStaticLib(sdk, arches)
 
-    def create_include_dir(self):
-        include_dir = os.path.join(self.framework_dir, "include")
+    def create_framework(self, lib: AppleStaticLib):
+        lib_name = lib.lib_name()
+
+        framework_dir = os.path.join(self.framework_dir, lib_name, "LibXray.framework")
+        create_dir_if_not_exists(framework_dir)
+
+        info_plist = os.path.join(self.build_dir, "template", "AppleGoInfo.plist")
+        shutil.copy(info_plist, framework_dir)
+
+        include_dir = os.path.join(framework_dir, "Headers")
         create_dir_if_not_exists(include_dir)
 
-        target = self.ios_targets[0]
         header_file = os.path.join(
             self.framework_dir,
-            f"{target.sdk}-{target.apple_arch}",
-            self.lib_header_file,
+            f"{lib.sdk}-{lib.apple_archs[0]}",
+            self.lib_header_file
         )
         shutil.copy(header_file, include_dir)
 
-    def create_framework(self):
-        libs = [
-            f"{self.ios_targets[0].sdk}-{self.ios_targets[0].apple_arch}",
-            f"{self.ios_targets[1].sdk}-{self.ios_targets[1].apple_arch}-{self.ios_targets[2].apple_arch}",
-            f"{self.macos_targets[0].sdk}-{self.macos_targets[0].apple_arch}-{self.macos_targets[1].apple_arch}",
-            f"{self.tvos_targets[0].sdk}-{self.tvos_targets[0].apple_arch}",
-            f"{self.tvos_targets[1].sdk}-{self.tvos_targets[1].apple_arch}-{self.tvos_targets[2].apple_arch}",
-        ]
-        include_dir = os.path.join(self.framework_dir, "include")
+        lib_file = os.path.join(
+            self.framework_dir,
+            lib_name,
+            self.lib_file
+        )
+        lib_dst = os.path.join(
+            framework_dir,
+            "LibXray"
+        )
+        shutil.copy(lib_file, lib_dst)
+
+
+    def create_xcframework(self, libs: list[AppleStaticLib]):
+        frameworks = map(lambda x: os.path.join(self.framework_dir, x.lib_name(), "LibXray.framework"), libs)
         cmd = ["xcodebuild", "-create-xcframework"]
-        for lib in libs:
-            lib_path = os.path.join(self.framework_dir, lib, self.lib_file)
-            cmd.extend(["-library", lib_path, "-headers", include_dir])
+        for framework in frameworks:
+            cmd.extend(["-framework", framework])
 
         output_file = os.path.join(self.lib_dir, "LibXray.xcframework")
         cmd.extend(["-output", output_file])
